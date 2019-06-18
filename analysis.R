@@ -1,16 +1,44 @@
 ### Setup
-library(data.table); library(ggplot2);
+library(data.table); library(ggplot2); library(lme4); library(BMA)
 rm(list = ls())
 
 ### Paths
 data.path <- "data/educ_dep_data.csv"
 
 ### Code
+## Prep data
+dt <- fread(data.path)
 
-## Read input data and prep person-day data
+# Turn everything into a number
+for(var in names(dt)) {
+    if(typeof(dt[[var]]) == "character") {
+        dt[[var]] <- as.numeric(dt[[var]])
+    }
+}
+
+# Remove NAs for non-death rows
+dt <- rbind(na.omit(dt[dead == 0]), dt[dead == 1])
+
+# Remove people without an initial observation
+dt <- dt[!(person %in% setdiff(unique(dt$person), unique(dt[time == 1]$person)))]
+
+# Reorder for viewing
+dt <- dt[order(person, time)]
+
+time.varying.vars <- c("income", "socialSupport", "familyNear", "disabled", "pain", "depression")
+time.fixed.vars <- setdiff(setdiff(names(dt), time.varying.vars), "person") # remove person as it is just an identifier, but we may want to investigate clustering in the future
+
+# Add lags for time.varying.vars
+for(var in time.varying.vars) {
+    dt[, paste0(var, "_lag") := shift(get(var)), by = person]
+}
+
 
 ## Estimate conditional probability models
+# Functions
 vectorize.fit <- function(model.fit, dt){
+    # Prep a vector of the coefficients from the model fits that can be used
+    # as part of a matrix that includes all variables in the input data
     coefs <-  coef(summary(model.fit))[,1]
     vec <- unlist(lapply(names(dt), function(name) {
         if(name %in% names(coefs)) {
@@ -20,64 +48,73 @@ vectorize.fit <- function(model.fit, dt){
         }
     }))
     vec <- c(coefs[1], vec)
+    return(vec)
 }
 
-get.pred.vars <- function(model.fit) {
-    rownames(attr(summary(model.fit)$terms, "factors"))[1]
-}
+# Fit time-varying models with all possible variables (except death!)
+binary.vars <- c("familyNear", "disabled", "pain", "depression")
+alive.dt <- dt[dead == 0]
+dt[disabled > 1, disabled := 1] # Find out what the other disabled values mean!!
+dt[pain > 1, pain := 1] # Find out what the other pain values mean!!
+model.fits <- lapply(time.varying.vars, function(var) {
+    print(var)
+    formula <- paste(var, "~", paste(c(time.fixed.vars, paste0(setdiff(time.varying.vars, var), "_lag")), collapse=" + "))
+    if(var %in% binary.vars) {
+        fit <- do.call("glm", list(as.formula(formula), data = as.name("alive.dt"), family = as.name("binomial")))
+    } else {
+        fit <- do.call("lm", list(as.formula(formula), data = as.name("alive.dt")))
+    }
+    coef.vec <- vectorize.fit(fit, dt)
+    return(coef.vec)
+})
 
-# Social support
+coef.matrix <- do.call(rbind, model.fits)
 
-# Family nearby
+# Fit mortality!
+dead.fit <- glm(dead ~ time + age + sex + childSES1 + childSES2 + educationAttainment + income_lag + socialSupport_lag + familyNear_lag + disabled_lag + pain_lag + depression_lag, 
+               data = dt, family = binomial(link = "logit"))
+dead.vec <- vectorize.fit(dead.fit, dt)
 
-# Other comorbidities
-
-# Depression
-
+# Combine into coefficient matrix
+coef.matrix <- rbind(coef.matrix, dead.vec)
+colnames(coef.matrix) <- c("Intercept", names(dt))
+rownames(coef.matrix) <- c(time.varying.vars, "dead")
 
 ## Step 3 - sample with replacement from data
-
 # Generate a baseline matrix
 gen.baseline <- function(n, baseline.dt, intervene) {
     M.n <- n * nrow(baseline.dt)
     M.ids <- sample(baseline.dt$id, M.n, replace = T)
-    days.no <- grep("daysno", names(baseline.dt), value = T)
-    baseline.dt[, c("day", "d", "gvhd", "platnorm", "relapse", days.no) := 0]
     if(intervene == 2) {
-        baseline.dt[, gvhd := 1]
+        baseline.dt[, educationAttainment := educationAttainment + 1]
     }
     dt.matrix <- as.matrix(baseline.dt)
     M <- cbind(dt.matrix[M.ids,])
     return(M)
 }
 
-# Update time varying predictors: day, daysq, daycu, daycurs1, dacurs2
+# Update time varying predictors: time and age (assume 2-year intervals)
 update.time <- function(M) {
-    day <- M[,"day"][1] + 1
-    M[,"day"] <- M[,"day"] + 1
-    M[, "daysq"] <- M[,"day"]**2
-    M[, "daycu"] <- M[,"day"]**3
-    M[, "daycurs1"] <- ((day>63)*((M[,"day"]-63)/63)**3)+((day>716)*((M[,"day"]-716)/63)**3)*(350.0-63) -((day>350)*((M[,"day"]-350)/63)**3)*(716-63)/(716-350)
-    M[, "daycurs2"] <- ((day>168)*((M[,"day"]-168)/63)**3)+((day>716)*((M[,"day"]-716)/63)**3)*(350-168) -((day>350)*((M[,"day"]-350)/63)**3)*(716-168)/(716-350)
+    M[,"time"] <- M[,"time"] + 1
+    M[, "age"] <- M[,"age"] + 2
     return(M)
 }
 
-# Update lags on each iteration: platnormm1, gvhdm1, relapsem1
-lag.list <- c("gvhd", "relapse", "platnorm")
-update.lags <- function(var.list, M) {
-    for(var in var.list) {
-        M[, paste0(var, "m1")] <- M[, var]
+# Update lags on time varying predictors
+update.lags <- function( M) {
+    for(var in time.varying.vars) {
+        M[, paste0(var, "_lag")] <- M[, var]
     }
     return(M)
 }
 
 
 # Predict log.odds, convert to probability, and sample from Bernoulli
-gen.draws <- function(var, M, coef.dt) {
+gen.draws <- function(var, M, coef.matrix) {
     var.idx <- which(colnames(M) == var)
     zero.idx <- which(M[, var.idx] == 0)
     if(length(zero.idx) > 0) {
-        coef.vec <- as.matrix(coef.dt[variable == var, 1:(ncol(coef.dt) - 1)])[1,]
+        coef.vec <- as.matrix(coef.matrix[variable == var, 1:(ncol(coef.matrix) - 1)])[1,]
         temp.M <- cbind(rep(1, length(zero.idx)), M[zero.idx,,drop = F])
         colnames(temp.M)[1] <- "(Intercept)"
         # Order variables
@@ -91,110 +128,58 @@ gen.draws <- function(var, M, coef.dt) {
     return(M)
 }
 
-# Update cumulative values on each iteration
-update.cum <- function(var, M) {
-    # Update days no platnorm, relapse, or gvhd
-    M[, paste0("daysno", var)] <- M[, paste0("daysno", var)] + (1 - M[, var])
-    # Update days platnorm, relapse, or gvhd
-    M[, paste0("days", var)] <- M[, paste0("days", var)] + M[, var]
-    if(var == "gvhd") {
-        # Interaction terms
-        M[, "day_gvhd"] <- M[, "gvhd"] * M[, var]
-        M[, "daysq_gvhd"] <- M[, "gvhd"] * M[, var]
-        M[, "daycu_gvhd"] <- M[, "gvhd"] * M[, var]
-    }
-    return(M)
-}
 
 
-
-
-simulate <- function(M, intervene, coef.dt) {
+simulate <- function(M, intervene, coef.matrix) {
     total <- nrow(M)
-    out.dt <- data.table()
-    # Remove censoring for all interventions
-    if(intervene > 0) {
-        var.list <- setdiff(coef.dt$variable, c("censlost"))
-    } else {
-        var.list <- coef.dt$variable 
-    }
-    # Remove gvhd for always, never and acute
-    if(intervene %in% 1:3) {
-        var.list <- setdiff(var.list, "gvhd")
-    }
+    var.list <- rownames(coef.matrix)
     # Loop through each day
     for(i in 1:max(dt$day)) {
-        # Add back in gvhd after 100 days for acute
-        if(intervene == 3 & i > 100) {
-            var.list <- c(var.list, "gvhd")
-        }
-        # remove gvhd after 100 days for chronic
-        if(intervene == 4 & i > 100) {
-            var.list <- setdiff(var.list, "gvhd")
-        }
         # Update lags and time variables
-        M <- update.lags(lag.list, M)
+        M <- update.lags(M)
         M <- update.time(M)
         # Generate a predicted value for each variable in order
         for(var in var.list) {
             var.idx <- which(colnames(M) == var)
-            M <- gen.draws(var, M, coef.dt)
+            M <- gen.draws(var, M, coef.matrix)
         }
-        # Pull out dead or censored and add to out table
-        dead.dt <- as.data.table(M[M[, "d"] == 1 | M[, "censlost"] == 1, ,drop = F])
+        # Pull out dead add to out table
+        dead.dt <- as.data.table(M[M[, "dead"] == 1, ,drop = F])
         if(nrow(dead.dt) > 0) {
             out.dt <- rbind(out.dt, dead.dt)
-            M <- M[!(M[, "d"] == 1 | M[, "censlost"] == 1), ,drop = F]
+            M <- M[!(M[, "dead"] == 1), ,drop = F]
         }
         if(nrow(M) == 0) {
             break
         }
-        print(paste0("Day ", i, " of ", max(dt$day), "; P(alive) = ", round(nrow(M) / total, 2)))
-        # Update cumulative variables
-        for (var in lag.list) {
-            M <- update.cum(var, M)
-        }
+        print(paste0("Day ", i, " of ", max(dt$time), "; P(alive) = ", round(nrow(M) / total, 2)))
     }
     out.dt <- rbind(out.dt, as.data.table(M))
     return(out.dt)
 }
 
+baseline <- dt[,min(time), by = person]
+
 # Natural course
-n.draws <- 1000
-M.nat <- gen.baseline(n.draws, dt[day == 1], intervene = 0)
-sim.nat <- simulate(M.nat, intervene = 0, coef.dt)
+n.draws <- 100
+M.nat <- gen.baseline(n.draws, dt[time == 1], intervene = 0)
+sim.nat <- simulate(M.nat, intervene = 0, coef.matrix)
 
-# Intervention (No GvHD)
-M.ngvhd <- gen.baseline(n.draws, dt[day == 1], intervene = 1)
-sim.ngvhd <- simulate(M.ngvhd, intervene = 1, coef.dt)
-
-# Intervention (Always GvHD)
-M.agvhd<- gen.baseline(n.draws, dt[day == 1], intervene = 2)
-sim.agvhd <- simulate(M.agvhd, intervene = 2, coef.dt)
-
-# Prevent Acute
-M.acute<- gen.baseline(n.draws, dt[day == 1], intervene = 3)
-sim.acute <- simulate(M.acute, intervene = 3, coef.dt)
-
-# Prevent Chronic
-M.chronic <- gen.baseline(n.draws, dt[day == 1], intervene = 4)
-sim.chronic <- simulate(M.chronic, intervene = 4, coef.dt)
+# Intervention
+M.educ<- gen.baseline(n.draws, dt[time == 1], intervene = 1)
+sim.educ <- simulate(M.educ, intervene = 1, coef.matrix)
 
 
 ## Step 6 - concatentate intervetion data sets and run Cox model
 sim.nat[, scenario := "Natural Course"]
-sim.agvhd[, scenario := "Always GvHD"]
-sim.ngvhd[, scenario := "No GvHD"]
-sim.acute[, scenario := "No Acute GvHD"]
-sim.chronic[, scenario := "No Chronic GvHD"]
-setnames(data.dt, c("t", "d_dea"), c("day", "d"))
+sim.educ[, scenario := "Education increase"]
 data.dt[, scenario := "Data"]
-sim.dt <- rbindlist(list(sim.nat, sim.agvhd, sim.ngvhd, sim.acute, sim.chronic), use.names = T, fill = T)
-out.dt <- sim.dt[, .(day, d, scenario)]
+sim.dt <- rbindlist(list(sim.nat, sim.educ), use.names = T, fill = T)
+out.dt <- sim.dt[, .(time, dead, scenario)]
 write.csv(out.dt, "results/sim_results.csv", row.names = F)
 
 # Make kaplan meier survival plots
-surv.fit <- survfit(Surv(day, d) ~ scenario, data=sim.dt, conf.type = "log-log")
+surv.fit <- survfit(Surv(time, d) ~ scenario, data=sim.dt, conf.type = "log-log")
 plot(surv.fit,  col=c("blue", "red", "green", "purple", "orange"),lty=c("dashed", "solid", "solid", "solid", "solid"), xlab="Days",
      ylab="Survival Probability", main="Kaplan Meier survial curve estimates")
 
@@ -224,23 +209,7 @@ print.hazard <- function(nat.dt, int.dt) {
     print(paste0(mean, " (", lower, ", ", upper, ")"))
 }
 
-# Never GvHD
-print.hazard(sim.nat, sim.ngvhd)
+# Education intervention
+print.hazard(sim.nat, sim.educ)
 
-# No Acute
-print.hazard(sim.nat, sim.acute)
 
-# No Chronic
-print.hazard(sim.nat, sim.chronic)
-© 2019 GitHub, Inc.
-Terms
-Privacy
-Security
-Status
-Help
-Contact GitHub
-Pricing
-API
-Training
-Blog
-About
