@@ -52,10 +52,11 @@ vectorize.fit <- function(model.fit, dt){
 }
 
 # Fit time-varying models with all possible variables (except death!)
-binary.vars <- c("familyNear", "disabled", "pain", "depression")
-alive.dt <- dt[dead == 0]
+binary.vars <- c("familyNear", "disabled", "pain", "depression", "dead")
 dt[disabled > 1, disabled := 1] # Find out what the other disabled values mean!!
 dt[pain > 1, pain := 1] # Find out what the other pain values mean!!
+alive.dt <- dt[dead == 0]
+
 model.fits <- lapply(time.varying.vars, function(var) {
     print(var)
     formula <- paste(var, "~", paste(c(time.fixed.vars, paste0(setdiff(time.varying.vars, var), "_lag")), collapse=" + "))
@@ -84,8 +85,8 @@ rownames(coef.matrix) <- c(time.varying.vars, "dead")
 # Generate a baseline matrix
 gen.baseline <- function(n, baseline.dt, intervene) {
     M.n <- n * nrow(baseline.dt)
-    M.ids <- sample(baseline.dt$id, M.n, replace = T)
-    if(intervene == 2) {
+    M.ids <- sample(1:nrow(baseline.dt), M.n, replace = T)
+    if(intervene == 1) {
         baseline.dt[, educationAttainment := educationAttainment + 1]
     }
     dt.matrix <- as.matrix(baseline.dt)
@@ -112,19 +113,21 @@ update.lags <- function( M) {
 # Predict log.odds, convert to probability, and sample from Bernoulli
 gen.draws <- function(var, M, coef.matrix) {
     var.idx <- which(colnames(M) == var)
-    zero.idx <- which(M[, var.idx] == 0)
-    if(length(zero.idx) > 0) {
-        coef.vec <- as.matrix(coef.matrix[variable == var, 1:(ncol(coef.matrix) - 1)])[1,]
-        temp.M <- cbind(rep(1, length(zero.idx)), M[zero.idx,,drop = F])
+    # zero.idx <- which(M[, var.idx] == 0)
+    # if(length(zero.idx) > 0) {
+        coef.vec <- as.vector(coef.matrix[var,])
+        temp.M <- cbind(rep(1, nrow(M)), M)
         colnames(temp.M)[1] <- "(Intercept)"
         # Order variables
-        coef.vec <- coef.vec[which(colnames(temp.M) == names(coef.vec))]
-        log.odds <- temp.M %*% coef.vec
-        odds <- exp(log.odds)
-        prob <- odds / (1 + odds)
-        draws <- unlist(lapply(prob, rbinom, n = 1, size = 1))
-        M[zero.idx, var.idx] <- draws
-    }
+        # coef.vec <- coef.vec[which(colnames(temp.M) == names(coef.vec))]
+        pred <- temp.M %*% coef.vec
+        if(var %in% binary.vars) {
+            odds <- exp(pred)
+            prob <- odds / (1 + odds)
+            pred <- unlist(lapply(prob, rbinom, n = 1, size = 1))
+        }
+        M[, var.idx] <- pred
+    # }
     return(M)
 }
 
@@ -132,9 +135,10 @@ gen.draws <- function(var, M, coef.matrix) {
 
 simulate <- function(M, intervene, coef.matrix) {
     total <- nrow(M)
+    out.dt <- data.table()
     var.list <- rownames(coef.matrix)
-    # Loop through each day
-    for(i in 1:max(dt$day)) {
+    # Loop through each time period
+    for(i in 1:20) {
         # Update lags and time variables
         M <- update.lags(M)
         M <- update.time(M)
@@ -152,16 +156,16 @@ simulate <- function(M, intervene, coef.matrix) {
         if(nrow(M) == 0) {
             break
         }
-        print(paste0("Day ", i, " of ", max(dt$time), "; P(alive) = ", round(nrow(M) / total, 2)))
+        print(paste0("Year ", 2*i, " of ", max(dt$time), "; P(alive) = ", round(nrow(M) / total, 2)))
     }
     out.dt <- rbind(out.dt, as.data.table(M))
     return(out.dt)
 }
 
-baseline <- dt[,min(time), by = person]
+
 
 # Natural course
-n.draws <- 100
+n.draws <- 1
 M.nat <- gen.baseline(n.draws, dt[time == 1], intervene = 0)
 sim.nat <- simulate(M.nat, intervene = 0, coef.matrix)
 
@@ -173,43 +177,20 @@ sim.educ <- simulate(M.educ, intervene = 1, coef.matrix)
 ## Step 6 - concatentate intervetion data sets and run Cox model
 sim.nat[, scenario := "Natural Course"]
 sim.educ[, scenario := "Education increase"]
-data.dt[, scenario := "Data"]
-sim.dt <- rbindlist(list(sim.nat, sim.educ), use.names = T, fill = T)
+dt[, scenario := "Data"]
+sim.dt <- rbindlist(list(sim.nat, sim.educ, dt), use.names = T, fill = T)
 out.dt <- sim.dt[, .(time, dead, scenario)]
 write.csv(out.dt, "results/sim_results.csv", row.names = F)
 
 # Make kaplan meier survival plots
-surv.fit <- survfit(Surv(time, d) ~ scenario, data=sim.dt, conf.type = "log-log")
-plot(surv.fit,  col=c("blue", "red", "green", "purple", "orange"),lty=c("dashed", "solid", "solid", "solid", "solid"), xlab="Days",
+surv.fit <- survfit(Surv(time, dead) ~ scenario, data=sim.dt, conf.type = "log-log")
+plot(surv.fit,  col=c("blue", "red", "green"),lty=c("dashed", "solid", "solid"), xlab="Years of Observation",
      ylab="Survival Probability", main="Kaplan Meier survial curve estimates")
 
 legend("topright",
-       c("Observed", "Natural course", "No Acute GvHD", "No Chronic GvHD", "No GvHD"),
-       col=c("blue", "red", "green", "purple", "orange"),
-       lty=c("dashed", "solid", "solid", "solid", "solid"), lwd=rep(3, 2), cex=0.9)
+       c("Observed", "Education Intervention", "Natural course"),
+       col=c("blue", "red", "green"),
+       lty=c("dashed", "solid", "solid"), lwd=rep(3, 2), cex=0.9)
 
-
-
-## Step 7: Cox Proportional Hazard Model and Uncertainty intervals
-print.hazard <- function(nat.dt, int.dt) {
-    coxph(Surv(day, d) ~ gvhd, data = all.p.day.dt)
-    rand <- sample(1:137000, 137000, replace = T)
-    boot.a <- unlist(lapply(1:137, function(i) {
-        idx <- rand[(i*137+1):((i+1)*137)]
-        cox.fit <- coxph(Surv(day, d) ~ scenario, data = rbind(nat.dt[idx], int.dt[idx]))
-        return(-1*summary(cox.fit)$coefficients[,"coef"])
-    }))
-    mean <- round(exp(mean(boot.a)), 2)
-    se <- 1.96 * sqrt(sd(exp(boot.a)) / 137)
-    lower <- round(mean - se, 2)
-    upper <- round(mean + se, 2)
-    
-    # lower <- round(exp(quantile(boot.a, 0.05)), 2)
-    # upper <- round(exp(quantile(boot.a, 0.95)), 2)
-    print(paste0(mean, " (", lower, ", ", upper, ")"))
-}
-
-# Education intervention
-print.hazard(sim.nat, sim.educ)
 
 
