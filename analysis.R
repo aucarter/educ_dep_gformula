@@ -1,3 +1,15 @@
+################################################################################
+## Purpose: CUse g-formula to investigate the impact of education on depression
+##          and mortality in the presence of time-varying confounders
+## Author: Austin Carter, aucarter@uw.edu
+## To Do: 
+## - Sample from full uncertainty
+## - Add lost-to-follow-up
+## - Model non-binary in log space
+## - Add nicely formatted tables
+## - Look into clustering (multiple observations per individual)
+################################################################################
+
 ### Setup
 library(data.table); library(ggplot2); library(lme4); library(BMA)
 rm(list = ls())
@@ -6,7 +18,7 @@ rm(list = ls())
 data.path <- "data/educ_dep_data.csv"
 
 ### Code
-## Prep data
+## Step 1: Prep data
 dt <- fread(data.path)
 
 # Turn everything into a number
@@ -25,16 +37,18 @@ dt <- dt[!(person %in% setdiff(unique(dt$person), unique(dt[time == 1]$person)))
 # Reorder for viewing
 dt <- dt[order(person, time)]
 
-time.varying.vars <- c("income", "socialSupport", "familyNear", "disabled", "pain", "depression")
-time.fixed.vars <- setdiff(setdiff(names(dt), time.varying.vars), "person") # remove person as it is just an identifier, but we may want to investigate clustering in the future
+time.varying.vars <- c("income", "socialSupport", "familyNear", "disabled", 
+                       "pain", "depression")
+# remove person as it is just an identifier, but we may want to investigate 
+# clustering in the future
+time.fixed.vars <- setdiff(setdiff(names(dt), time.varying.vars), "person") 
 
 # Add lags for time.varying.vars
 for(var in time.varying.vars) {
     dt[, paste0(var, "_lag") := shift(get(var)), by = person]
 }
 
-
-## Estimate conditional probability models
+## Step 2: Estimate conditional probability models
 # Functions
 vectorize.fit <- function(model.fit, dt){
     # Prep a vector of the coefficients from the model fits that can be used
@@ -59,11 +73,21 @@ alive.dt <- dt[dead == 0]
 
 model.fits <- lapply(time.varying.vars, function(var) {
     print(var)
-    formula <- paste(var, "~", paste(c(time.fixed.vars, paste0(setdiff(time.varying.vars, var), "_lag")), collapse=" + "))
+    formula <- paste(var, "~", 
+                     paste(c(time.fixed.vars, 
+                             paste0(
+                                 setdiff(time.varying.vars, var), 
+                                 "_lag")
+                             ), 
+                           collapse=" + ")
+                     )
     if(var %in% binary.vars) {
-        fit <- do.call("glm", list(as.formula(formula), data = as.name("alive.dt"), family = as.name("binomial")))
+        fit <- do.call("glm", list(as.formula(formula), 
+                                   data = as.name("alive.dt"), 
+                                   family = as.name("binomial")))
     } else {
-        fit <- do.call("lm", list(as.formula(formula), data = as.name("alive.dt")))
+        fit <- do.call("lm", list(as.formula(formula), 
+                                  data = as.name("alive.dt")))
     }
     coef.vec <- vectorize.fit(fit, dt)
     return(coef.vec)
@@ -71,8 +95,10 @@ model.fits <- lapply(time.varying.vars, function(var) {
 
 coef.matrix <- do.call(rbind, model.fits)
 
-# Fit mortality!
-dead.fit <- glm(dead ~ time + age + sex + childSES1 + childSES2 + educationAttainment + income_lag + socialSupport_lag + familyNear_lag + disabled_lag + pain_lag + depression_lag, 
+# Fit mortality
+dead.fit <- glm(dead ~ time + age + sex + childSES1 + childSES2 + 
+                    educationAttainment + income_lag + socialSupport_lag + 
+                    familyNear_lag + disabled_lag + pain_lag + depression_lag, 
                data = dt, family = binomial(link = "logit"))
 dead.vec <- vectorize.fit(dead.fit, dt)
 
@@ -81,9 +107,10 @@ coef.matrix <- rbind(coef.matrix, dead.vec)
 colnames(coef.matrix) <- c("Intercept", names(dt))
 rownames(coef.matrix) <- c(time.varying.vars, "dead")
 
-## Step 3 - sample with replacement from data
-# Generate a baseline matrix
+## Step 3: Sample with replacement from data and simulate
+# Functions
 gen.baseline <- function(n, baseline.dt, intervene) {
+    # Generate a baseline matrix
     M.n <- n * nrow(baseline.dt)
     M.ids <- sample(1:nrow(baseline.dt), M.n, replace = T)
     if(intervene == 1) {
@@ -94,24 +121,25 @@ gen.baseline <- function(n, baseline.dt, intervene) {
     return(M)
 }
 
-# Update time varying predictors: time and age (assume 2-year intervals)
 update.time <- function(M) {
+    # Update time varying predictors: time and age (assume 2-year intervals)
     M[,"time"] <- M[,"time"] + 1
     M[, "age"] <- M[,"age"] + 2
     return(M)
 }
 
-# Update lags on time varying predictors
 update.lags <- function( M) {
+    # Update lags on time varying predictors
     for(var in time.varying.vars) {
         M[, paste0(var, "_lag")] <- M[, var]
     }
     return(M)
 }
 
-
-# Predict log.odds, convert to probability, and sample from Bernoulli
 gen.draws <- function(var, M, coef.matrix) {
+    # Predict 
+    # Case 1: log odds, convert to probability, and sample from Bernoulli
+    # Case 2: log, sample from a normal distribution, exponetiate
     var.idx <- which(colnames(M) == var)
     # zero.idx <- which(M[, var.idx] == 0)
     # if(length(zero.idx) > 0) {
@@ -124,16 +152,18 @@ gen.draws <- function(var, M, coef.matrix) {
         if(var %in% binary.vars) {
             odds <- exp(pred)
             prob <- odds / (1 + odds)
-            pred <- unlist(lapply(prob, rbinom, n = 1, size = 1))
+            val <- unlist(lapply(prob, rbinom, n = 1, size = 1))
+        } else {
+            log.val <- rnorm(1, pred)
+            val <- exp(log.val)
         }
-        M[, var.idx] <- pred
+        M[, var.idx] <- val
     # }
     return(M)
 }
 
-
-
 simulate <- function(M, intervene, coef.matrix) {
+    # Simulate 20 time periods (40 years)
     total <- nrow(M)
     out.dt <- data.table()
     var.list <- rownames(coef.matrix)
@@ -147,7 +177,7 @@ simulate <- function(M, intervene, coef.matrix) {
             var.idx <- which(colnames(M) == var)
             M <- gen.draws(var, M, coef.matrix)
         }
-        # Pull out dead add to out table
+        # Pull out dead and add to out table
         dead.dt <- as.data.table(M[M[, "dead"] == 1, ,drop = F])
         if(nrow(dead.dt) > 0) {
             out.dt <- rbind(out.dt, dead.dt)
@@ -156,25 +186,24 @@ simulate <- function(M, intervene, coef.matrix) {
         if(nrow(M) == 0) {
             break
         }
-        print(paste0("Year ", 2*i, " of ", max(dt$time), "; P(alive) = ", round(nrow(M) / total, 2)))
+        print(paste0("Year ", 2*i, " of ", max(dt$time), "; P(alive) = ", 
+                     round(nrow(M) / total, 2)))
     }
     out.dt <- rbind(out.dt, as.data.table(M))
     return(out.dt)
 }
-
-
 
 # Natural course
 n.draws <- 1
 M.nat <- gen.baseline(n.draws, dt[time == 1], intervene = 0)
 sim.nat <- simulate(M.nat, intervene = 0, coef.matrix)
 
-# Intervention
+# Intervention 
 M.educ<- gen.baseline(n.draws, dt[time == 1], intervene = 1)
 sim.educ <- simulate(M.educ, intervene = 1, coef.matrix)
 
-
-## Step 6 - concatentate intervetion data sets and run Cox model
+## Step 4: Concatentate simulation data sets, write results, and
+##         plot kaplan meier survival plots
 sim.nat[, scenario := "Natural Course"]
 sim.educ[, scenario := "Education increase"]
 dt[, scenario := "Data"]
@@ -183,9 +212,11 @@ out.dt <- sim.dt[, .(time, dead, scenario)]
 write.csv(out.dt, "results/sim_results.csv", row.names = F)
 
 # Make kaplan meier survival plots
-surv.fit <- survfit(Surv(time, dead) ~ scenario, data=sim.dt, conf.type = "log-log")
-plot(surv.fit,  col=c("blue", "red", "green"),lty=c("dashed", "solid", "solid"), xlab="Years of Observation",
-     ylab="Survival Probability", main="Kaplan Meier survial curve estimates")
+surv.fit <- survfit(Surv(time, dead) ~ scenario, data=sim.dt, 
+                    conf.type = "log-log")
+plot(surv.fit,  col=c("blue", "red", "green"),lty=c("dashed", "solid", "solid"), 
+     xlab="Years of Observation", ylab="Survival Probability", 
+     main="Kaplan Meier survial curve estimates")
 
 legend("topright",
        c("Observed", "Education Intervention", "Natural course"),
