@@ -1,13 +1,17 @@
 ################################################################################
-## Purpose: CUse g-formula to investigate the impact of education on depression
+## Purpose: Use g-formula to investigate the impact of education on depression
 ##          and mortality in the presence of time-varying confounders
 ## Author: Austin Carter, aucarter@uw.edu
 ## To Do: 
+## - Direct vs indirect
 ## - Sample from full uncertainty
 ## - Add lost-to-follow-up
 ## - Model non-binary in log space
 ## - Add nicely formatted tables
 ## - Look into clustering (multiple observations per individual)
+## - Investigate age-specific mortality rate (prevalence of depression)
+## - Incidence of depression (is the onset delayed) median?
+## - Add a tracker for depression onset in simulation
 ################################################################################
 
 ### Setup
@@ -115,6 +119,7 @@ gen.baseline <- function(n, baseline.dt, intervene) {
     M.ids <- sample(1:nrow(baseline.dt), M.n, replace = T)
     if(intervene == 1) {
         baseline.dt[, educationAttainment := educationAttainment + 1]
+        baseline.dt[educationAttainment > 5, educationAttainment := 5]
     }
     dt.matrix <- as.matrix(baseline.dt)
     M <- cbind(dt.matrix[M.ids,])
@@ -154,8 +159,9 @@ gen.draws <- function(var, M, coef.matrix) {
             prob <- odds / (1 + odds)
             val <- unlist(lapply(prob, rbinom, n = 1, size = 1))
         } else {
-            log.val <- rnorm(1, pred)
-            val <- exp(log.val)
+            # log.val <- rnorm(1, pred)
+            # val <- exp(log.val)
+            val <- pred
         }
         M[, var.idx] <- val
     # }
@@ -194,7 +200,7 @@ simulate <- function(M, intervene, coef.matrix, n = 20) {
 }
 
 # Natural course
-n.draws <- 1
+n.draws <- 1000
 M.nat <- gen.baseline(n.draws, dt[time == 1], intervene = 0)
 sim.nat <- simulate(M.nat, intervene = 0, coef.matrix)
 
@@ -208,7 +214,7 @@ sim.nat[, scenario := "Natural Course"]
 sim.educ[, scenario := "Education increase"]
 dt[, scenario := "Data"]
 sim.dt <- rbindlist(list(sim.nat, sim.educ, dt), use.names = T, fill = T)
-out.dt <- sim.dt[, .(time, dead, scenario)]
+out.dt <- sim.dt[, .(time, dead, depression, scenario)]
 write.csv(out.dt, "results/sim_results.csv", row.names = F)
 
 # Make kaplan meier survival plots
@@ -216,12 +222,11 @@ surv.fit <- survfit(Surv(time, dead) ~ scenario, data=sim.dt,
                     conf.type = "log-log")
 plot(surv.fit,  col=c("blue", "red", "green"),lty=c("dashed", "solid", "solid"), 
      xlab="Years of Observation", ylab="Survival Probability", 
-     main="Kaplan Meier survial curve estimates")
+     main="Kaplan Meier survival curve estimates")
 
 legend("topright",
        c("Observed", "Education Intervention", "Natural course"),
        col=c("blue", "red", "green"),
        lty=c("dashed", "solid", "solid"), lwd=rep(3, 2), cex=0.9)
-
 
 
