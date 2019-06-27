@@ -162,13 +162,13 @@ gen.draws <- function(var, M, coef.matrix) {
     return(M)
 }
 
-simulate <- function(M, intervene, coef.matrix) {
-    # Simulate 20 time periods (40 years)
+simulate <- function(M, intervene, coef.matrix, n = 20) {
+    # Simulate n time periods (40 years)
     total <- nrow(M)
     out.dt <- data.table()
     var.list <- rownames(coef.matrix)
     # Loop through each time period
-    for(i in 1:20) {
+    for(i in 1:n) {
         # Update lags and time variables
         M <- update.lags(M)
         M <- update.time(M)
@@ -186,7 +186,7 @@ simulate <- function(M, intervene, coef.matrix) {
         if(nrow(M) == 0) {
             break
         }
-        print(paste0("Year ", 2*i, " of ", max(dt$time), "; P(alive) = ", 
+        print(paste0("Year ", 2 * i, " of ", 2 * n, "; P(alive) = ", 
                      round(nrow(M) / total, 2)))
     }
     out.dt <- rbind(out.dt, as.data.table(M))
