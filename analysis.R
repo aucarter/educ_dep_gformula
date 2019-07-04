@@ -170,10 +170,14 @@ gen.draws <- function(var, M, coef.matrix) {
     # Case 1: log odds, convert to probability, and sample from Bernoulli
     # Case 2: log, sample from a normal distribution, exponetiate
     var.idx <- which(colnames(M) == var)
-    # zero.idx <- which(M[, var.idx] == 0)
-    # if(length(zero.idx) > 0) {
+    zero.idx <- which(M[, var.idx] == 0)
+    if(length(zero.idx) > 0 | !(var %in% binary.vars)) {
         coef.vec <- as.vector(coef.matrix[var,])
-        temp.M <- cbind(rep(1, nrow(M)), M)
+        if(var %in% binary.vars) {
+            temp.M <- cbind(rep(1, length(zero.idx)), M[zero.idx,,drop = F])
+        } else {
+            temp.M <- cbind(rep(1, nrow(M)), M)
+        }
         colnames(temp.M)[1] <- "(Intercept)"
         # Order variables
         # coef.vec <- coef.vec[which(colnames(temp.M) == names(coef.vec))]
@@ -187,8 +191,12 @@ gen.draws <- function(var, M, coef.matrix) {
             # val <- exp(log.val)
             val <- pred
         }
-        M[, var.idx] <- val
-    # }
+        if(var %in% binary.vars) {
+            M[zero.idx, var.idx] <- val
+        } else {
+            M[, var.idx] <- val
+        }
+    }
     return(M)
 }
 
@@ -204,7 +212,6 @@ simulate <- function(M, intervene, coef.matrix, n = 40) {
         M <- update.time(M)
         # Generate a predicted value for each variable in order
         for(var in var.list) {
-            var.idx <- which(colnames(M) == var)
             M <- gen.draws(var, M, coef.matrix)
         }
         # Pull out dead and add to out table
