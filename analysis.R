@@ -3,15 +3,19 @@
 ##          and mortality in the presence of time-varying confounders
 ## Author: Austin Carter, aucarter@uw.edu
 ## To Do: 
-## - Direct vs indirect
-## - Sample from full uncertainty
-## - Add lost-to-follow-up
-## - Model non-binary in log space
-## - Add nicely formatted tables
-## - Look into clustering (multiple observations per individual)
-## - Investigate age-specific mortality rate (prevalence of depression)
-## - Incidence of depression (is the onset delayed) median?
-## - Add a tracker for depression onset in simulation
+## - Direct vs indirect [ ]
+## - Add lost-to-follow-up [X]
+## - Change time to be age difference [X]
+## - Investigate age-specific mortality rate (prevalence of depression) [ ]
+## - Incidence of depression (is the onset delayed) median? [ ]
+## - Add a tracker for depression onset in simulation [ ]
+## - Sample from full uncertainty [ ]
+## - Model non-binary in log space [ ]
+## - Add nicely formatted tables [ ]
+## - Look into clustering (multiple observations per individual) [ ]
+##
+## Notes:
+## - No one dies before 10 years of follow-up
 ################################################################################
 
 ### Setup
@@ -38,11 +42,22 @@ dt <- rbind(na.omit(dt[dead == 0]), dt[dead == 1])
 # Remove people without an initial observation
 dt <- dt[!(person %in% setdiff(unique(dt$person), unique(dt[time == 1]$person)))]
 
-# Reorder for viewing
-dt <- dt[order(person, time)]
+# Add a loss-to-follow-up indicator
+dt[, ltfu := ifelse(dead == 0 & time == max(time), 1, 0)]
 
-time.varying.vars <- c("income", "socialSupport", "familyNear", "disabled", 
-                       "pain", "depression")
+# Add years of follow-up and remove times
+dt[, years := age - min(age), by = .(person)]
+dt[, time := NULL]
+
+# Reorder for viewing
+dt <- dt[order(person, years)]
+
+# Try removing income because of correlation with education
+dt[, income := NULL]
+
+time.varying.vars <- intersect(names(dt), 
+    c("income", "socialSupport", "familyNear", "disabled", "pain", "depression"))
+
 # remove person as it is just an identifier, but we may want to investigate 
 # clustering in the future
 time.fixed.vars <- setdiff(setdiff(names(dt), time.varying.vars), "person") 
@@ -70,7 +85,7 @@ vectorize.fit <- function(model.fit, dt){
 }
 
 # Fit time-varying models with all possible variables (except death!)
-binary.vars <- c("familyNear", "disabled", "pain", "depression", "dead")
+binary.vars <- c("familyNear", "disabled", "pain", "depression", "ltfu", "dead")
 dt[disabled > 1, disabled := 1] # Find out what the other disabled values mean!!
 dt[pain > 1, pain := 1] # Find out what the other pain values mean!!
 alive.dt <- dt[dead == 0]
@@ -99,17 +114,25 @@ model.fits <- lapply(time.varying.vars, function(var) {
 
 coef.matrix <- do.call(rbind, model.fits)
 
+# Fit loss-to-follow-up
+ltfu.fit <- glm(ltfu ~ years + age + sex + childSES1 + childSES2 + 
+                    educationAttainment + socialSupport_lag + 
+                    familyNear_lag + disabled_lag + pain_lag + depression_lag, 
+                data = dt, family = binomial(link = "logit"))
+ltfu.vec <- vectorize.fit(ltfu.fit, dt)
+
 # Fit mortality
-dead.fit <- glm(dead ~ time + age + sex + childSES1 + childSES2 + 
-                    educationAttainment + income_lag + socialSupport_lag + 
+dead.fit <- glm(dead ~ years + age + sex + childSES1 + childSES2 + 
+                    educationAttainment + socialSupport_lag + 
                     familyNear_lag + disabled_lag + pain_lag + depression_lag, 
                data = dt, family = binomial(link = "logit"))
 dead.vec <- vectorize.fit(dead.fit, dt)
 
 # Combine into coefficient matrix
+coef.matrix <- rbind(coef.matrix, ltfu.vec)
 coef.matrix <- rbind(coef.matrix, dead.vec)
 colnames(coef.matrix) <- c("Intercept", names(dt))
-rownames(coef.matrix) <- c(time.varying.vars, "dead")
+rownames(coef.matrix) <- c(time.varying.vars, "ltfu", "dead")
 
 ## Step 3: Sample with replacement from data and simulate
 # Functions
@@ -118,8 +141,9 @@ gen.baseline <- function(n, baseline.dt, intervene) {
     M.n <- n * nrow(baseline.dt)
     M.ids <- sample(1:nrow(baseline.dt), M.n, replace = T)
     if(intervene == 1) {
-        baseline.dt[, educationAttainment := educationAttainment + 1]
-        baseline.dt[educationAttainment > 5, educationAttainment := 5]
+        # baseline.dt[, educationAttainment := educationAttainment + 1]
+        # baseline.dt[educationAttainment > 5, educationAttainment := 5]
+        baseline.dt[, educationAttainment := 5]
     }
     dt.matrix <- as.matrix(baseline.dt)
     M <- cbind(dt.matrix[M.ids,])
@@ -127,9 +151,9 @@ gen.baseline <- function(n, baseline.dt, intervene) {
 }
 
 update.time <- function(M) {
-    # Update time varying predictors: time and age (assume 2-year intervals)
-    M[,"time"] <- M[,"time"] + 1
-    M[, "age"] <- M[,"age"] + 2
+    # Update time varying predictors: years and age (assume 2-year intervals)
+    M[,"years"] <- M[,"years"] + 1
+    M[, "age"] <- M[,"age"] + 1
     return(M)
 }
 
@@ -168,7 +192,7 @@ gen.draws <- function(var, M, coef.matrix) {
     return(M)
 }
 
-simulate <- function(M, intervene, coef.matrix, n = 20) {
+simulate <- function(M, intervene, coef.matrix, n = 40) {
     # Simulate n time periods (40 years)
     total <- nrow(M)
     out.dt <- data.table()
@@ -184,7 +208,7 @@ simulate <- function(M, intervene, coef.matrix, n = 20) {
             M <- gen.draws(var, M, coef.matrix)
         }
         # Pull out dead and add to out table
-        dead.dt <- as.data.table(M[M[, "dead"] == 1, ,drop = F])
+        dead.dt <- as.data.table(M[M[, "dead"] == 1 | M[, "ltfu"] == 1, ,drop = F])
         if(nrow(dead.dt) > 0) {
             out.dt <- rbind(out.dt, dead.dt)
             M <- M[!(M[, "dead"] == 1), ,drop = F]
@@ -192,7 +216,7 @@ simulate <- function(M, intervene, coef.matrix, n = 20) {
         if(nrow(M) == 0) {
             break
         }
-        print(paste0("Year ", 2 * i, " of ", 2 * n, "; P(alive) = ", 
+        print(paste0("Year ", i, " of ", n, "; P(alive) = ", 
                      round(nrow(M) / total, 2)))
     }
     out.dt <- rbind(out.dt, as.data.table(M))
@@ -200,12 +224,12 @@ simulate <- function(M, intervene, coef.matrix, n = 20) {
 }
 
 # Natural course
-n.draws <- 1000
-M.nat <- gen.baseline(n.draws, dt[time == 1], intervene = 0)
+n.draws <- 10
+M.nat <- gen.baseline(n.draws, dt[years == 0], intervene = 0)
 sim.nat <- simulate(M.nat, intervene = 0, coef.matrix)
 
 # Intervention 
-M.educ<- gen.baseline(n.draws, dt[time == 1], intervene = 1)
+M.educ<- gen.baseline(n.draws, dt[years == 0], intervene = 1)
 sim.educ <- simulate(M.educ, intervene = 1, coef.matrix)
 
 ## Step 4: Concatentate simulation data sets, write results, and
@@ -214,19 +238,35 @@ sim.nat[, scenario := "Natural Course"]
 sim.educ[, scenario := "Education increase"]
 dt[, scenario := "Data"]
 sim.dt <- rbindlist(list(sim.nat, sim.educ, dt), use.names = T, fill = T)
-out.dt <- sim.dt[, .(time, dead, depression, scenario)]
-write.csv(out.dt, "results/sim_results.csv", row.names = F)
+out.dt <- sim.dt[, .(years, dead, depression, scenario)]
+# write.csv(out.dt, "results/sim_results.csv", row.names = F)
 
 # Make kaplan meier survival plots
-surv.fit <- survfit(Surv(time, dead) ~ scenario, data=sim.dt, 
+surv.fit <- survfit(Surv(age, depression) ~ scenario , data=sim.dt, 
                     conf.type = "log-log")
 plot(surv.fit,  col=c("blue", "red", "green"),lty=c("dashed", "solid", "solid"), 
-     xlab="Years of Observation", ylab="Survival Probability", 
-     main="Kaplan Meier survival curve estimates")
+     xlab="Age", ylab="Probability Not Depressed", 
+     main="Kaplan Meier depression curve estimates")
 
-legend("topright",
+legend("bottomleft",
        c("Observed", "Education Intervention", "Natural course"),
        col=c("blue", "red", "green"),
        lty=c("dashed", "solid", "solid"), lwd=rep(3, 2), cex=0.9)
 
 
+## Calculate summary statistics
+sim.dt[, age_group := age - age%%10]
+sim.dt[, total := .N, by = .(scenario, age_group)]
+summ.dt <- sim.dt[scenario != "Data", lapply(.SD, sum), by = .(age_group, total, scenario), .SDcols = c("depression", "dead")]
+summ.dt[, c("dep_rate", "dead_rate") := .(depression / total, dead / total)]
+
+gg <- ggplot(summ.dt) + geom_line(aes(x = age_group, y = dep_rate, color = scenario)) +
+    ylim(0, max(summ.dt$dep_rate)) + ggtitle("Depression rate by age for each scenario") +
+    theme_classic()
+gg
+
+gg <- ggplot(summ.dt) + geom_line(aes(x = age_group, y = dead_rate, color = scenario)) +
+    ylim(0, max(summ.dt$dead_rate)) + ggtitle("Mortality rate by age for each scenario") +
+    theme_classic()
+gg
+## End
