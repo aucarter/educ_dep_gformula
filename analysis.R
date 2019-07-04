@@ -8,7 +8,7 @@
 ## - Change time to be age difference [X]
 ## - Investigate age-specific mortality rate (prevalence of depression) [ ]
 ## - Incidence of depression (is the onset delayed) median? [ ]
-## - Add a tracker for depression onset in simulation [ ]
+## - Add a tracker for depression onset in simulation [X]
 ## - Sample from full uncertainty [ ]
 ## - Model non-binary in log space [ ]
 ## - Add nicely formatted tables [ ]
@@ -192,6 +192,9 @@ gen.draws <- function(var, M, coef.matrix) {
             val <- pred
         }
         if(var %in% binary.vars) {
+            if(var == "depression") {
+                M[zero.idx, "dep_onset"] =  val * temp.M[, "years"]
+            }
             M[zero.idx, var.idx] <- val
         } else {
             M[, var.idx] <- val
@@ -230,8 +233,14 @@ simulate <- function(M, intervene, coef.matrix, n = 40) {
     return(out.dt)
 }
 
+# Add depression onset var to data and coef.matrix
+coef.matrix <- cbind(coef.matrix, rep(0, nrow(coef.matrix)))
+colnames(coef.matrix)[ncol(coef.matrix)] <- "dep_onset"
+
+dt[, dep_onset := 0]
+
 # Natural course
-n.draws <- 10
+n.draws <- 1
 M.nat <- gen.baseline(n.draws, dt[years == 0], intervene = 0)
 sim.nat <- simulate(M.nat, intervene = 0, coef.matrix)
 
